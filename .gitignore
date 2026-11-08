@@ -1,0 +1,6 @@
+.pio/
+.idea/
+__pycache__/
+include/lan_secret.h
+lan.key
+.env
