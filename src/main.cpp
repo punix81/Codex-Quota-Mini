@@ -16,6 +16,9 @@ namespace {
 constexpr uint8_t kTouchPin = 6;
 constexpr uint32_t kDebounceMs = 35;
 constexpr uint32_t kStaleMs = 90000;
+constexpr uint32_t kFrameIntervalMs = 67;
+constexpr uint32_t kGaugeTransitionMs = 420;
+constexpr uint32_t kOrbitPeriodMs = 3200;
 constexpr int kCenter = 120;
 constexpr size_t kPageCount = 4;
 
@@ -59,48 +62,108 @@ void render(uint32_t now) {
   auto& gfx = buffered ? static_cast<lgfx::LGFXBase&>(frame)
                        : static_cast<lgfx::LGFXBase&>(tft);
   const auto& page = pages[page_index];
-  const uint16_t background = tft.color565(0, 8, 18);
-  const uint16_t track = tft.color565(38, 56, 66);
-  const uint16_t accent = tft.color565(72, 240, 170);
-  const uint16_t muted = tft.color565(155, 177, 185);
-  const uint16_t text = tft.color565(250, 255, 255);
+  const bool data_stale = stale(now);
+  const uint16_t background = 0x0000;
+  const uint16_t white = 0xFFFF;
+  const uint16_t grid = tft.color565(0, 32, 0);
+  const uint16_t track = tft.color565(32, 64, 0);
+  const uint16_t lime = tft.color565(150, 255, 0);
+  const uint16_t muted = tft.color565(160, 190, 155);
+  const uint16_t accent = data_stale || codex_error ? tft.color565(255, 160, 0) : lime;
+
+  // Ease the gauge into the new reading without changing the displayed value.
+  static size_t previous_page = kPageCount;
+  static int previous_target = -1;
+  static float displayed = 0.0f;
+  static float transition_start = 0.0f;
+  static uint32_t transition_time = 0;
+  const int target = max(0, page.percent);
+  if (page_index != previous_page || target != previous_target) {
+    transition_start = page_index == previous_page ? displayed : 0.0f;
+    transition_time = now;
+    previous_page = page_index;
+    previous_target = target;
+  }
+  const float progress = min(now - transition_time, kGaugeTransitionMs) /
+                         static_cast<float>(kGaugeTransitionMs);
+  const float eased = 1.0f - (1.0f - progress) * (1.0f - progress);
+  displayed = buffered ? transition_start + (target - transition_start) * eased : target;
 
   gfx.startWrite();
   gfx.fillScreen(background);
-  gfx.fillArc(kCenter, kCenter, 114, 108, -220.0f, 40.0f, track);
-  if (page.percent > 0) {
-    gfx.fillArc(kCenter, kCenter, 114, 108, -220.0f,
-                -220.0f + 2.6f * page.percent, accent);
+  gfx.drawCircle(kCenter, kCenter, 109, grid);
+  gfx.drawCircle(kCenter, kCenter, 96, grid);
+
+  // Leave a gap at the bottom for the status and page indicators.
+  constexpr int kFirstAngle = 140;
+  constexpr int kSegmentStep = 10;
+  constexpr int kSegments = 26;
+  const float active_end = kFirstAngle + kSegments * kSegmentStep * displayed / 100.0f;
+  for (int i = 0; i < kSegments; ++i) {
+    const int start = kFirstAngle + i * kSegmentStep;
+    const int end = start + 7;
+    gfx.fillArc(kCenter, kCenter, 106, 100, start, end, track);
+    if (active_end > start) {
+      gfx.fillArc(kCenter, kCenter, 106, 100, start,
+                  min(active_end, static_cast<float>(end)), accent);
+    }
   }
+
+  if (buffered) {
+    const uint32_t phase = now % kOrbitPeriodMs;
+    const float angle = 360.0f * phase / kOrbitPeriodMs;
+    gfx.fillArc(kCenter, kCenter, 117, 114, angle - 30.0f, angle - 10.0f, track);
+    gfx.fillArc(kCenter, kCenter, 117, 113, angle - 10.0f, angle, accent);
+    const int scan_y = 94 + phase * 55 / kOrbitPeriodMs;
+    gfx.drawFastHLine(39, scan_y, 162, grid);
+  }
+
+  gfx.drawFastHLine(35, 99, 10, accent);
+  gfx.drawFastVLine(35, 99, 12, accent);
+  gfx.drawFastHLine(195, 99, 10, accent);
+  gfx.drawFastVLine(204, 99, 12, accent);
+  gfx.drawFastHLine(35, 144, 10, accent);
+  gfx.drawFastVLine(35, 133, 12, accent);
+  gfx.drawFastHLine(195, 144, 10, accent);
+  gfx.drawFastVLine(204, 133, 12, accent);
 
   gfx.setTextDatum(textdatum_t::middle_center);
-  gfx.setFont(&lgfx::fonts::Font2);
-  gfx.setTextColor(muted, background);
-  gfx.drawString("CODEX", kCenter, 51);
+  gfx.setFont(&lgfx::fonts::FreeMonoBold9pt7b);
   gfx.setTextColor(accent, background);
-  gfx.drawString(page.title, kCenter, 79);
+  gfx.drawString("CODEX // LINK", kCenter, 49);
+  gfx.setFont(&lgfx::fonts::Font2);
+  gfx.setTextColor(white, background);
+  gfx.drawString(page.title, kCenter, 75);
 
-  gfx.setFont(&lgfx::fonts::FreeSansBold24pt7b);
-  if (gfx.textWidth(page.value) > 180) {
-    gfx.setFont(&lgfx::fonts::FreeSansBold12pt7b);
+  gfx.setFont(&lgfx::fonts::FreeMonoBold24pt7b);
+  if (gfx.textWidth(page.value) > 154) {
+    gfx.setFont(&lgfx::fonts::FreeMonoBold12pt7b);
   }
-  gfx.setTextColor(text, background);
-  gfx.drawString(page.value, kCenter, 123);
+  if (gfx.textWidth(page.value) > 154) {
+    gfx.setFont(&lgfx::fonts::Font2);
+  }
+  gfx.setTextColor(white, background);
+  gfx.drawString(page.value, kCenter, 120);
 
   gfx.setFont(&lgfx::fonts::Font2);
   gfx.setTextColor(muted, background);
-  gfx.drawString(page.detail, kCenter, 158);
-  if (stale(now)) {
-    gfx.drawString("STALE DATA", kCenter, 182);
+  gfx.drawString(page.detail, kCenter, 157);
+
+  const char* status = "SIGNAL // LIVE";
+  if (data_stale) {
+    status = "STALE DATA";
   } else if (codex_error) {
-    gfx.drawString("CODEX UNAVAILABLE", kCenter, 182);
+    status = "CODEX UNAVAILABLE";
   } else if (!has_data) {
-    gfx.drawString(!kQuotaUrl[0] || !kLanKey[0] ? "WAITING FOR USB" :
-                   WiFi.isConnected() ? "WAITING FOR PI" : "WIFI: CodexQuota-Setup", kCenter, 182);
+    status = !kQuotaUrl[0] || !kLanKey[0] ? "WAITING FOR USB" :
+             WiFi.isConnected() ? "WAITING FOR PI" : "WIFI: CodexQuota-Setup";
   }
+  gfx.setTextColor(accent, background);
+  gfx.drawString(status, kCenter, 179);
+
   for (size_t i = 0; i < kPageCount; ++i) {
-    gfx.fillCircle(96 + static_cast<int>(i) * 16, 202, 3,
-                   i == page_index ? accent : track);
+    const int x = 89 + static_cast<int>(i) * 17;
+    gfx.fillRect(x, 201, 11, 4, i == page_index ? accent : track);
   }
   gfx.endWrite();
 
@@ -236,9 +299,12 @@ void loop() {
   pollQuota(now);
 
   static bool was_stale = false;
+  static uint32_t last_frame = 0;
   const uint32_t render_time = millis();
   const bool is_stale = stale(render_time);
-  if (dirty || is_stale != was_stale) {
+  const bool animate = buffered && render_time - last_frame >= kFrameIntervalMs;
+  if (dirty || is_stale != was_stale || animate) {
+    last_frame = render_time;
     render(render_time);
     dirty = false;
     was_stale = is_stale;
