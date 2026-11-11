@@ -1,215 +1,70 @@
-"""Send Codex account usage to the ESP32 through its USB serial port."""
+"""Send AI Quota Hub data through USB, or inspect V1/V2 without a device."""
 
 import argparse
-from datetime import date, datetime
-import json
-from math import isfinite
+from datetime import date
 import os
 from pathlib import Path
-from queue import Empty, Queue
 import shutil
-import subprocess
-from threading import Thread
 import time
+from typing import Any
+
+from quota_hub.codex import CodexAdapter, RpcClient, credit_metric, quota_metric, token_metric
+from quota_hub.codex_rpc import CodexAppServer, RpcError
+from quota_hub.protocol import display_page, encode_frame, v1_snapshot
+from quota_hub.runtime import build_registry, collect, error_frame
 
 
-class RpcError(RuntimeError):
-    pass
+# Preserve the original helpers for callers importing bridge.py.
+def quota_page(window: Any, expected_minutes: int) -> dict[str, Any]:
+    return display_page(quota_metric(window, "5h" if expected_minutes == 300 else "weekly", int(time.time())))
 
 
-class CodexAppServer:
-    def __init__(self, executable):
-        self.process = subprocess.Popen(
-            [executable, "app-server", "--listen", "stdio://"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-        )
-        self.responses = Queue()
-        self.request_id = 0
-        self.reader = Thread(target=self._read, daemon=True)
-        self.reader.start()
-        try:
-            self.request("initialize", {
-                "clientInfo": {"name": "codex-quota-mini", "version": "1.0.0"},
-            })
-            self._send({"method": "initialized"})
-        except BaseException:
-            self.close()
-            raise
-
-    def _read(self):
-        try:
-            for line in self.process.stdout:
-                try:
-                    self.responses.put(json.loads(line))
-                except ValueError:
-                    continue
-        finally:
-            self.responses.put(None)
-
-    def _send(self, message):
-        self.process.stdin.write(json.dumps(message) + "\n")
-        self.process.stdin.flush()
-
-    def request(self, method, params=None):
-        self.request_id += 1
-        message = {"method": method, "id": self.request_id}
-        if params is not None:
-            message["params"] = params
-        self._send(message)
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            try:
-                response = self.responses.get(timeout=max(0, deadline - time.monotonic()))
-            except Empty:
-                break
-            if response is None:
-                raise RpcError("The Codex process stopped.")
-            if not isinstance(response, dict) or response.get("id") != self.request_id:
-                continue
-            if "error" in response:
-                raise RpcError(f"{method}: RPC error {response['error'].get('code')}.")
-            return response["result"]
-        raise RpcError(f"{method}: request timed out.")
-
-    def close(self):
-        if self.process.poll() is None:
-            self.process.terminate()
-        try:
-            self.process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
-        self.reader.join(timeout=1)
-        self.process.stdin.close()
-        self.process.stdout.close()
+def credit_page(credits: Any) -> dict[str, Any]:
+    return display_page(credit_metric(credits, int(time.time())))
 
 
-def quota_page(window, expected_minutes):
-    window = window or {}
-    used = window.get("usedPercent")
-    minutes = window.get("windowDurationMins")
-    if minutes not in (None, expected_minutes):
-        detail = f"Window: {minutes} min"
-    else:
-        detail = "Remaining quota"
-    if not isinstance(used, (int, float)) or not isfinite(used):
-        return {"value": "--", "detail": "Quota unavailable"}
-
-    remaining = round(100 - max(0, min(100, used)))
-    resets_at = window.get("resetsAt")
-    if isinstance(resets_at, (int, float)):
-        try:
-            reset = datetime.fromtimestamp(resets_at)
-            fmt = "%H:%M" if reset.date() == date.today() else "%d/%m %H:%M"
-            detail = f"Reset {reset:{fmt}}"
-            if minutes not in (None, expected_minutes):
-                detail = f"{minutes}m  {reset:{fmt}}"
-        except (ValueError, OSError, OverflowError):
-            pass
-    return {"value": f"{remaining}%", "detail": detail, "percent": remaining}
+def tokens_page(usage: Any, day: date) -> dict[str, Any]:
+    return display_page(token_metric(usage, day, int(time.time())))
 
 
-def credit_page(credits):
-    credits = credits or {}
-    if credits.get("unlimited") is True:
-        value = "Unlimited"
-    elif credits.get("balance") is not None:
-        value = str(credits["balance"])[:20]
-    elif credits.get("hasCredits") is False:
-        value = "0"
-    else:
-        value = "--"
-    return {"value": value, "detail": "Available credits"}
+def snapshot(server: RpcClient) -> dict[str, Any]:
+    return v1_snapshot((CodexAdapter(lambda: server).fetch(),))
 
 
-def tokens_page(usage, day):
-    latest_day = date.min
-    latest_count = None
-    for bucket in usage.get("dailyUsageBuckets") or []:
-        count = bucket.get("tokens")
-        try:
-            bucket_day = date.fromisoformat(bucket.get("startDate") or "")
-        except (TypeError, ValueError):
-            continue
-        if latest_day < bucket_day <= day and isinstance(count, int) and count >= 0:
-            latest_day = bucket_day
-            latest_count = count
-    if latest_count is None:
-        return {"value": "--", "detail": "Waiting for data"}
-    return {"value": f"{latest_count:,}".replace(",", " "),
-            "detail": f"Total for {latest_day:%d/%m}"}
-
-
-def snapshot(server):
-    result = server.request("account/rateLimits/read")
-    legacy = result.get("rateLimits") or {}
-    limit = (result.get("rateLimitsByLimitId") or {}).get("codex")
-    if not limit and legacy.get("limitId") in (None, "codex"):
-        limit = legacy
-    if not limit or (not limit.get("primary") and not limit.get("secondary")):
-        raise RpcError("Codex quotas unavailable. Check your ChatGPT sign-in in Codex.")
-
-    try:
-        usage = server.request("account/usage/read")
-    except RpcError:
-        usage = {}
-    return {
-        "v": 1, "ok": True,
-        "pages": [
-            quota_page(limit.get("primary"), 300),
-            quota_page(limit.get("secondary"), 10080),
-            credit_page(limit.get("credits")),
-            tokens_page(usage, date.today()),
-        ],
-    }
-
-
-def encode_frame(data):
-    return (json.dumps(data, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
-
-
-def bridge(executable, port):
+def bridge(executable: str, port: str, demo: bool = False) -> None:
     import serial
 
     interval = 30
-    print(f"Codex USB bridge on {port}, refreshing every {interval} s. Press Ctrl+C to stop.", flush=True)
-    while True:
-        server = None
-        try:
-            with serial.Serial(port, 115200, write_timeout=2) as device:
-                time.sleep(1)
-                while True:
-                    start = time.monotonic()
-                    try:
-                        if server is None:
-                            server = CodexAppServer(executable)
-                        data = snapshot(server)
-                    except (OSError, RpcError) as error:
-                        print(f"Codex: {error}", flush=True)
-                        data = {"v": 1, "ok": False}
-                        if server is not None:
-                            server.close()
-                            server = None
-
-                    device.write(encode_frame(data))
-                    time.sleep(max(0, interval - (time.monotonic() - start)))
-        except serial.SerialException:
-            print(f"{port} unavailable. Retrying in 3 s.", flush=True)
-        finally:
-            if server is not None:
-                server.close()
-        time.sleep(3)
+    print(f"AI Quota Hub USB bridge on {port}, refreshing every {interval} s. Press Ctrl+C to stop.", flush=True)
+    registry = build_registry(executable, demo)
+    try:
+        while True:
+            try:
+                with serial.Serial(port, 115200, write_timeout=2) as device:
+                    time.sleep(1)
+                    while True:
+                        start = time.monotonic()
+                        try:
+                            data = collect(registry).v1
+                        except ValueError:
+                            data = error_frame(1)
+                        device.write(data)
+                        time.sleep(max(0, interval - (time.monotonic() - start)))
+            except serial.SerialException:
+                print(f"{port} unavailable. Retrying in 3 s.", flush=True)
+            finally:
+                registry.close()
+            time.sleep(3)
+    finally:
+        registry.close()
 
 
-def find_codex(override=None):
+def find_codex(override: str | None = None) -> str | None:
     if override:
         return shutil.which(override)
-
     executable = shutil.which("codex")
     if executable:
         return executable
-
     local_app_data = os.environ.get("LOCALAPPDATA")
     if not local_app_data:
         return None
@@ -219,30 +74,39 @@ def find_codex(override=None):
     return str(newest) if newest else None
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--port", help="ESP32 USB port, for example COM11.")
-    mode.add_argument("--check", action="store_true", help="Check Codex without opening the USB port.")
+    mode.add_argument("--check", action="store_true", help="Inspect data without opening USB.")
     parser.add_argument("--codex", metavar="EXE", help="Optional path to the Codex executable.")
+    parser.add_argument("--protocol", type=int, choices=(1, 2), default=1, help="Inspection protocol (default: 1).")
+    parser.add_argument("--demo", action="store_true", help="Use synthetic data without an account.")
     args = parser.parse_args()
-    executable = find_codex(args.codex)
-    if not executable:
+    if args.port and args.protocol != 1:
+        parser.error("The current ESP32 firmware accepts V1 only. Use --check for V2.")
+    executable = "" if args.demo else find_codex(args.codex)
+    if executable is None:
         parser.error("Codex was not found. Specify the executable with --codex.")
-
     try:
         if args.check:
-            server = CodexAppServer(executable)
+            registry = build_registry(executable, args.demo)
             try:
-                print(json.dumps(snapshot(server), indent=2))
+                publication = collect(registry)
+                frames = (publication.v1,) if args.protocol == 1 else publication.v2
+                for frame in frames:
+                    print(frame.decode("ascii"), end="")
+                # Keep --check useful in scripts when collection failed.
+                if publication.v1 == error_frame(1) and args.protocol == 1:
+                    parser.exit(1)
             finally:
-                server.close()
+                registry.close()
         else:
-            bridge(executable, args.port)
+            bridge(executable, args.port, args.demo)
     except KeyboardInterrupt:
         return
-    except (OSError, RpcError, ImportError) as error:
-        parser.exit(1, f"{error}\n")
+    except (OSError, RpcError, ImportError, ValueError) as error:
+        parser.exit(1, f"AI Quota Hub failed ({type(error).__name__}).\n")
 
 
 if __name__ == "__main__":
